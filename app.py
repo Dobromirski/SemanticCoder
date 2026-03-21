@@ -3,19 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
 
 from modules.claude_client import ClaudeClient
-from modules.cost_estimator import (
-    estimate_coding_cost,
-    estimate_frame_building_cost,
-    estimate_validation_cost,
-    format_cost_summary,
-)
 from modules.coder import code_column
 from modules.data_io import (
     detect_text_columns,
@@ -28,8 +20,6 @@ from modules.data_io import (
 )
 from modules.frame_builder import build_frame_initial, refine_frame
 from modules.validator import run_validation
-
-load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -61,11 +51,7 @@ for key, val in DEFAULTS.items():
 
 
 def get_client() -> ClaudeClient:
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key or api_key == "your-api-key-here":
-        st.error("ANTHROPIC_API_KEY not configured. Set it in the .env file.")
-        st.stop()
-    return ClaudeClient(api_key)
+    return ClaudeClient()
 
 
 # ---------------------------------------------------------------------------
@@ -271,16 +257,8 @@ elif st.session_state.step == 2:
         codes_df = pd.DataFrame(frame.get("codes", []))
         st.dataframe(codes_df, use_container_width=True)
 
-        # Cost estimate
-        coding_cost = estimate_coding_cost(
-            df, text_col, cfg.get("batch_size", 25)
-        )
         total_cols = len(st.session_state.text_columns)
-        st.info(
-            f"Estimated cost for coding {total_cols} column(s): "
-            f"${coding_cost['cost_usd'] * total_cols:.2f} "
-            f"({coding_cost['responses']} responses x {total_cols} columns)"
-        )
+        st.info(f"Ready to code {total_cols} column(s) via Max subscription (no API cost).")
 
         if st.button("Proceed to Coding", type="primary"):
             st.session_state.step = 3
@@ -367,14 +345,9 @@ elif st.session_state.step == 4:
         st.error(f"Code column '{code_col}' not found. Go back to coding.")
         st.stop()
 
-    col1, col2 = st.columns(2)
-    with col1:
-        sample_size = st.number_input(
-            "Validation sample size", min_value=50, max_value=300, value=100
-        )
-    with col2:
-        val_cost = estimate_validation_cost(sample_size)
-        st.info(f"Estimated validation cost: ${val_cost['cost_usd']:.2f}")
+    sample_size = st.number_input(
+        "Validation sample size", min_value=50, max_value=300, value=100
+    )
 
     if st.session_state.validation is None:
         if st.button("Run Validation", type="primary"):

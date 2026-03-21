@@ -1,53 +1,92 @@
-"""Thin wrapper over the Anthropic API with retry logic and model switching."""
+"""Claude Code CLI wrapper for Max subscription — no API key needed.
+
+Calls the `claude` CLI as a subprocess, passing prompts via stdin.
+Based on the pattern from qualitative-research-analyzer.
+"""
 
 from __future__ import annotations
 
 import json
 import re
+import subprocess
+import sys
 import time
 from typing import Any
 
-import anthropic
 
-
-MODEL_OPUS = "claude-opus-4-20250514"
-MODEL_SONNET = "claude-sonnet-4-20250514"
+MODEL_OPUS = "opus"
+MODEL_SONNET = "sonnet"
 
 
 class ClaudeClient:
-    def __init__(self, api_key: str) -> None:
-        self.client = anthropic.Anthropic(api_key=api_key)
+    """Wrapper that calls Claude Code CLI in non-interactive mode."""
 
     def call(
         self,
         system: str,
         user: str,
         model: str = MODEL_SONNET,
-        temperature: float = 0.2,
-        max_tokens: int = 8192,
         retries: int = 3,
+        timeout: int = 600,
+        **_kwargs: Any,
     ) -> str:
-        """Single API call with exponential backoff."""
+        """Single CLI call with retry logic."""
+        retry_delay = 10
         last_err: Exception | None = None
+
         for attempt in range(retries):
             try:
-                resp = self.client.messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    system=system,
-                    messages=[{"role": "user", "content": user}],
+                cmd = [
+                    "claude",
+                    "-p",
+                    "--output-format", "text",
+                    "--no-session-persistence",
+                    "--model", model,
+                    "--disallowed-tools",
+                    "Edit,Write,Bash,NotebookEdit,Glob,Grep,WebSearch,WebFetch",
+                    "--system-prompt", system,
+                ]
+
+                result = subprocess.run(
+                    cmd,
+                    input=user,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    timeout=timeout,
                 )
-                return resp.content[0].text
-            except anthropic.RateLimitError as exc:
-                wait = getattr(exc, "retry_after", None) or (2 ** attempt * 2)
-                time.sleep(wait)
+
+                if result.returncode != 0:
+                    error_msg = result.stderr.strip() if result.stderr else f"Exit code {result.returncode}"
+                    raise RuntimeError(f"Claude CLI error: {error_msg}")
+
+                response = result.stdout.strip()
+                if not response:
+                    raise RuntimeError("Claude CLI returned empty response")
+
+                return response
+
+            except subprocess.TimeoutExpired:
+                last_err = RuntimeError(f"Claude CLI timeout (attempt {attempt + 1})")
+                if attempt < retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+
+            except FileNotFoundError:
+                raise RuntimeError(
+                    "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+                )
+
+            except RuntimeError as exc:
                 last_err = exc
-            except anthropic.APIError as exc:
-                if attempt == retries - 1:
-                    raise
-                time.sleep(2 ** attempt)
-                last_err = exc
+                if attempt < retries - 1:
+                    print(
+                        f"  Attempt {attempt + 1} failed, retrying in {retry_delay}s...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(retry_delay)
+                    continue
+
         raise last_err  # type: ignore[misc]
 
     def call_json(
@@ -56,10 +95,7 @@ class ClaudeClient:
         user: str,
         **kwargs: Any,
     ) -> dict | list:
-        """Call the API and parse JSON from the response.
-
-        Handles the common case where Claude wraps JSON in ```json``` blocks.
-        """
+        """Call CLI and parse JSON from the response."""
         raw = self.call(system, user, **kwargs)
         return parse_json(raw)
 
@@ -79,4 +115,4 @@ def parse_json(raw: str) -> dict | list:
     match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw)
     if match:
         return json.loads(match.group(1))
-    raise ValueError(f"Could not extract JSON from response:\n{raw[:200]}...")
+    raise ValueError(f"Could not extract JSON from response:\n{raw[:300]}...")
