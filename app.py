@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 from modules.claude_client import ClaudeClient
+from modules.auditor import audit_other_codes, reconcile_disagreements
 from modules.coder import code_column
 from modules.data_io import (
     detect_text_columns,
@@ -44,7 +45,10 @@ DEFAULTS = {
     "frame_approved": False,
     "coded_df": None,
     "current_coding_col_idx": 0,
+    "coding_phase": "code",  # code → audit_98 → validate → reconcile → done
+    "audit_98_result": None,
     "validation": None,
+    "reconciliation": None,
 }
 for key, val in DEFAULTS.items():
     st.session_state.setdefault(key, val)
@@ -60,8 +64,7 @@ def get_client() -> ClaudeClient:
 STEPS = {
     1: "Upload & Configure",
     2: "Build Coding Frame",
-    3: "Code Responses",
-    4: "Validation",
+    3: "Code & Validate (3 agents)",
     5: "Export",
 }
 
@@ -271,128 +274,212 @@ elif st.session_state.step == 2:
 
 
 # ===================================================================
-# STEP 3 — Code All Responses
+# STEP 3 — Code, Audit, Validate (3-agent pipeline)
 # ===================================================================
 elif st.session_state.step == 3:
-    st.header("3. Code Responses")
+    st.header("3. Code & Validate")
 
     df = st.session_state.df
     frame = st.session_state.frame
     cfg = st.session_state.config
     text_cols = st.session_state.text_columns
     col_idx = st.session_state.current_coding_col_idx
+    phase = st.session_state.coding_phase
 
-    if col_idx < len(text_cols):
-        text_col = text_cols[col_idx]
-        code_col = text_col.replace("t", "c") if text_col.endswith("t") else f"{text_col}_code"
+    def _code_col_name(tc: str) -> str:
+        return tc.replace("t", "c") if tc.endswith("t") else f"{tc}_code"
 
-        st.info(f"Coding column **{text_col}** → **{code_col}** ({col_idx + 1}/{len(text_cols)})")
+    # --- PHASE 1: Coding (Sonnet) ---
+    if phase == "code":
+        if col_idx < len(text_cols):
+            text_col = text_cols[col_idx]
+            code_col = _code_col_name(text_col)
+            st.subheader(f"Agent 1 — Coding: {text_col} ({col_idx + 1}/{len(text_cols)})")
 
-        if st.button(f"Start coding '{text_col}'", type="primary"):
-            client = get_client()
-            progress = st.progress(0, text="Starting...")
+            if st.button(f"Start coding '{text_col}'", type="primary"):
+                client = get_client()
+                progress = st.progress(0, text="Starting...")
 
-            def on_progress(current: int, total: int) -> None:
-                pct = current / total
-                progress.progress(pct, text=f"Batch {current}/{total}")
+                def on_progress(current: int, total: int) -> None:
+                    progress.progress(current / total, text=f"Batch {current}/{total}")
 
-            with st.spinner("Coding in progress..."):
-                coded_df = code_column(
-                    client,
-                    df,
-                    text_col,
-                    code_col,
-                    frame,
-                    batch_size=cfg.get("batch_size", 25),
-                    progress_callback=on_progress,
-                )
-                st.session_state.df = coded_df
-                st.session_state.current_coding_col_idx = col_idx + 1
+                with st.spinner("Agent 1 (Sonnet) coding in progress..."):
+                    coded_df = code_column(
+                        client, df, text_col, code_col, frame,
+                        batch_size=cfg.get("batch_size", 25),
+                        progress_callback=on_progress,
+                    )
+                    st.session_state.df = coded_df
+                    st.session_state.current_coding_col_idx = col_idx + 1
+                    st.rerun()
+        else:
+            # All columns coded — show distribution and move to audit
+            st.success(f"Agent 1 complete — all {len(text_cols)} columns coded.")
+            for tc in text_cols:
+                cc = _code_col_name(tc)
+                if cc in df.columns:
+                    st.subheader(f"Distribution: {cc}")
+                    dist = df[cc].value_counts().sort_index()
+                    n98 = int(dist.get(98, 0))
+                    n99 = int(dist.get(99, 0))
+                    total = len(df)
+                    st.bar_chart(dist)
+                    if n98 + n99 > 0:
+                        pct = (n98 + n99) / total * 100
+                        st.warning(f"Code 98/99: {n98 + n99} responses ({pct:.1f}%) — Agent 2 will review these.")
+
+            if st.button("Run Agent 2 — Audit 98/99 codes", type="primary"):
+                st.session_state.coding_phase = "audit_98"
                 st.rerun()
-    else:
-        st.success(f"All {len(text_cols)} columns coded!")
 
-        # Show distribution for each coded column
-        for text_col in text_cols:
-            code_col = text_col.replace("t", "c") if text_col.endswith("t") else f"{text_col}_code"
-            if code_col in df.columns:
-                st.subheader(f"Distribution: {code_col}")
-                dist = df[code_col].value_counts().sort_index()
-                st.bar_chart(dist)
+    # --- PHASE 2: Audit 98/99 (Opus) ---
+    elif phase == "audit_98":
+        st.subheader("Agent 2 — Auditing 98/99 codes (Opus)")
+        st.caption("An independent agent reviews all code 98 (Other) and 99 (DK/NA) assignments, "
+                   "checking if they were genuine or misses from Agent 1.")
 
-        st.dataframe(df.head(20), use_container_width=True)
+        if st.session_state.audit_98_result is None:
+            client = get_client()
+            progress = st.progress(0, text="Starting audit...")
 
-        if st.button("Proceed to Validation", type="primary"):
-            st.session_state.step = 4
+            def on_audit_progress(current: int, total: int, msg: str) -> None:
+                progress.progress(current / total, text=f"{msg} — batch {current}/{total}")
+
+            all_audit_results = []
+            for tc in text_cols:
+                cc = _code_col_name(tc)
+                if cc not in df.columns:
+                    continue
+                with st.spinner(f"Agent 2 auditing {cc}..."):
+                    updated_df, audit_res = audit_other_codes(
+                        client, df, tc, cc, frame,
+                        progress_callback=on_audit_progress,
+                    )
+                    st.session_state.df = updated_df
+                    df = updated_df
+                    all_audit_results.append((cc, audit_res))
+
+            st.session_state.audit_98_result = all_audit_results
             st.rerun()
+        else:
+            for cc, audit_res in st.session_state.audit_98_result:
+                st.write(f"**{cc}**: reviewed {audit_res.total_reviewed}, "
+                         f"recoded {audit_res.recoded}, kept {audit_res.kept}")
+                if audit_res.changes:
+                    with st.expander(f"Changes in {cc}"):
+                        st.dataframe(pd.DataFrame(audit_res.changes), use_container_width=True)
 
+            # Show updated distributions
+            for tc in text_cols:
+                cc = _code_col_name(tc)
+                if cc in df.columns:
+                    dist = df[cc].value_counts().sort_index()
+                    n98 = int(dist.get(98, 0))
+                    total = len(df)
+                    st.write(f"**{cc}** after audit: {n98} remaining code 98 ({n98/total*100:.1f}%)")
 
-# ===================================================================
-# STEP 4 — Validation
-# ===================================================================
-elif st.session_state.step == 4:
-    st.header("4. Validation")
+            if st.button("Run Agent 3 — Independent Validation", type="primary"):
+                st.session_state.coding_phase = "validate"
+                st.rerun()
 
-    df = st.session_state.df
-    frame = st.session_state.frame
-    text_cols = st.session_state.text_columns
+    # --- PHASE 3: Independent validation (Opus) ---
+    elif phase == "validate":
+        st.subheader("Agent 3 — Independent Validation (Opus)")
+        st.caption("A third independent agent re-codes a random sample of 100 responses "
+                   "without seeing the previous coding. Measures agreement rate.")
 
-    # Use first column for validation
-    text_col = text_cols[0]
-    code_col = text_col.replace("t", "c") if text_col.endswith("t") else f"{text_col}_code"
+        if st.session_state.validation is None:
+            text_col = text_cols[0]
+            code_col = _code_col_name(text_col)
 
-    if code_col not in df.columns:
-        st.error(f"Code column '{code_col}' not found. Go back to coding.")
-        st.stop()
-
-    sample_size = st.number_input(
-        "Validation sample size", min_value=50, max_value=300, value=100
-    )
-
-    if st.session_state.validation is None:
-        if st.button("Run Validation", type="primary"):
             client = get_client()
             progress = st.progress(0, text="Starting validation...")
 
             def on_val_progress(current: int, total: int) -> None:
                 progress.progress(current / total, text=f"Batch {current}/{total}")
 
-            with st.spinner("Independent audit in progress..."):
+            with st.spinner("Agent 3 validating independently..."):
                 result = run_validation(
                     client, df, text_col, code_col, frame,
-                    sample_size=sample_size,
+                    sample_size=100,
                     progress_callback=on_val_progress,
                 )
                 st.session_state.validation = result
                 st.rerun()
-    else:
-        result = st.session_state.validation
-
-        # Big metric
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Agreement Rate", f"{result.agreement_rate:.1%}")
-        col2.metric("Compared", result.total_compared)
-        col3.metric("Disagreements", len(result.disagreements))
-
-        if result.agreement_rate >= 0.90:
-            st.success("Excellent agreement! The coding is reliable.")
-        elif result.agreement_rate >= 0.80:
-            st.warning("Good agreement, but review the disagreements below.")
         else:
-            st.error("Low agreement. Consider revising the coding frame.")
+            result = st.session_state.validation
 
-        if result.disagreements:
-            st.subheader("Disagreements")
-            dis_df = pd.DataFrame(result.disagreements)
-            st.dataframe(dis_df, use_container_width=True)
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Agreement Rate", f"{result.agreement_rate:.1%}")
+            col2.metric("Compared", result.total_compared)
+            col3.metric("Disagreements", len(result.disagreements))
 
-        if st.button("Proceed to Export", type="primary"):
-            st.session_state.step = 5
-            st.rerun()
+            if result.agreement_rate >= 0.90:
+                st.success("Agreement >= 90% — coding is reliable.")
+            elif result.agreement_rate >= 0.80:
+                st.warning("Agreement 80-90% — review disagreements.")
+            else:
+                st.error("Agreement < 80% — consider revising the coding frame.")
 
-        if st.button("Re-run validation"):
-            st.session_state.validation = None
-            st.rerun()
+            if result.disagreements:
+                st.subheader("Disagreements")
+                st.dataframe(pd.DataFrame(result.disagreements), use_container_width=True)
+
+                if len(result.disagreements) > 0:
+                    if st.button("Resolve disagreements (third opinion)", type="primary"):
+                        st.session_state.coding_phase = "reconcile"
+                        st.rerun()
+
+            if st.button("Proceed to Export", type="primary"):
+                st.session_state.step = 5
+                st.rerun()
+
+    # --- PHASE 4: Reconciliation (Opus) ---
+    elif phase == "reconcile":
+        st.subheader("Resolving Disagreements")
+        st.caption("A fourth agent reviews each disagreement and picks the correct code "
+                   "(or assigns a new one if both are wrong).")
+
+        if st.session_state.reconciliation is None:
+            text_col = text_cols[0]
+            code_col = _code_col_name(text_col)
+            result = st.session_state.validation
+
+            client = get_client()
+            progress = st.progress(0, text="Resolving...")
+
+            def on_rec_progress(current: int, total: int, msg: str) -> None:
+                progress.progress(current / total, text=f"{msg} — batch {current}/{total}")
+
+            with st.spinner("Resolving disagreements..."):
+                updated_df, resolutions = reconcile_disagreements(
+                    client, df, text_col,
+                    result.disagreements, frame,
+                    progress_callback=on_rec_progress,
+                )
+                st.session_state.df = updated_df
+                st.session_state.reconciliation = resolutions
+                st.rerun()
+        else:
+            resolutions = st.session_state.reconciliation
+            st.success(f"Resolved {len(resolutions)} disagreements.")
+            if resolutions:
+                st.dataframe(pd.DataFrame(resolutions), use_container_width=True)
+
+            if st.button("Re-run validation to confirm", type="secondary"):
+                st.session_state.validation = None
+                st.session_state.reconciliation = None
+                st.session_state.coding_phase = "validate"
+                st.rerun()
+
+            if st.button("Proceed to Export", type="primary"):
+                st.session_state.step = 5
+                st.rerun()
+
+
+# ===================================================================
+# STEP 4 — (reserved, pipeline is in step 3)
+# ===================================================================
 
 
 # ===================================================================
