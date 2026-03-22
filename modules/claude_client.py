@@ -67,7 +67,6 @@ class ClaudeClient:
                     self._cli_path,
                     "-p",
                     "--output-format", "text",
-                    "--verbose",
                     "--no-session-persistence",
                     "--model", model,
                     "--max-turns", "1",
@@ -124,7 +123,14 @@ class ClaudeClient:
         **kwargs: Any,
     ) -> dict | list:
         """Call CLI and parse JSON from the response."""
-        raw = self.call(system, user, **kwargs)
+        # Reinforce JSON-only instruction at end of user message
+        user_with_json_reminder = (
+            user
+            + "\n\n---\nIMPORTANT: Respond with ONLY valid JSON. "
+            "No headings, no markdown, no explanations, no text before or after. "
+            "Your entire response must be a single JSON object starting with { or ["
+        )
+        raw = self.call(system, user_with_json_reminder, **kwargs)
         return parse_json(raw)
 
 

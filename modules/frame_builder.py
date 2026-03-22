@@ -14,6 +14,51 @@ from .prompts import (
 )
 
 
+def _normalize_frame(raw: dict | list) -> dict:
+    """Normalize Claude's JSON response into our standard frame format.
+
+    Claude may return codes under different keys or as a bare list.
+    We normalize to: {"codes": [...], "decision_rules": [...]}
+    """
+    # If Claude returned a list directly, treat as codes
+    if isinstance(raw, list):
+        return {"codes": raw, "decision_rules": []}
+
+    # Look for codes under various keys
+    codes = None
+    for key in ("codes", "coding_frame", "frame", "categories", "codebook"):
+        if key in raw and isinstance(raw[key], list):
+            codes = raw[key]
+            break
+
+    if codes is None:
+        # Maybe the dict itself has "code" keys at top level — unlikely but handle
+        codes = []
+
+    # Normalize each code entry
+    normalized_codes = []
+    for c in codes:
+        normalized_codes.append({
+            "code": c.get("code", c.get("id", 0)),
+            "label": c.get("label", c.get("name", "")),
+            "description": c.get("description", c.get("desc", "")),
+            "includes": c.get("includes", c.get("examples", [])),
+            "excludes": c.get("excludes", []),
+        })
+
+    # Look for decision rules
+    rules = None
+    for key in ("decision_rules", "rules", "disambiguation_rules", "disambiguation"):
+        if key in raw and isinstance(raw[key], list):
+            rules = raw[key]
+            break
+
+    return {
+        "codes": normalized_codes,
+        "decision_rules": rules or [],
+    }
+
+
 def build_frame_initial(
     client: ClaudeClient,
     responses: list[str],
@@ -42,7 +87,8 @@ def build_frame_initial(
         f"{numbered}"
     )
 
-    return client.call_json(system=system, user=user_msg, model=MODEL_OPUS)
+    raw = client.call_json(system=system, user=user_msg, model=MODEL_OPUS)
+    return _normalize_frame(raw)
 
 
 def refine_frame(
@@ -66,7 +112,8 @@ def refine_frame(
         f"{numbered}"
     )
 
-    return client.call_json(system=system, user=user_msg, model=MODEL_OPUS)
+    raw = client.call_json(system=system, user=user_msg, model=MODEL_OPUS)
+    return _normalize_frame(raw)
 
 
 def build_frame_iteratively(
