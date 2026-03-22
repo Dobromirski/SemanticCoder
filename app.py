@@ -203,12 +203,22 @@ elif st.session_state.step == 2:
                                 cfg["max_codes"],
                                 cfg["language"],
                             )
-                        st.session_state.frame = frame
-                        st.session_state.frame_history.append(frame)
-                        st.session_state.frame_iteration = iteration + 1
-                        st.rerun()
+                        # Validate frame has codes
+                        if not frame.get("codes"):
+                            st.error("Frame returned with no codes. Raw response saved in debug.")
+                            st.session_state["_debug_frame"] = frame
+                        else:
+                            st.session_state.frame = frame
+                            st.session_state.frame_history.append(frame)
+                            st.session_state.frame_iteration = iteration + 1
+                            st.rerun()
                     except Exception as exc:
                         st.error(f"Error: {exc}")
+
+        # Debug: show raw response if frame was empty
+        if st.session_state.get("_debug_frame") is not None:
+            with st.expander("Debug: raw Claude response"):
+                st.json(st.session_state["_debug_frame"])
 
         # Show current frame if we have one
         if st.session_state.frame:
