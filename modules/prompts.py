@@ -37,7 +37,10 @@ examples must also be in {language}.
 
 {base_frame_instruction}
 
-Return ONLY valid JSON (no markdown fences) with this structure:
+CRITICAL: Your response must contain ONLY valid JSON — no explanations, no headings, \
+no markdown fences, no text before or after the JSON. Start with {{ and end with }}.
+
+JSON structure:
 {{
   "codes": [
     {{"code": 1, "label": "...", "description": "...", "includes": ["..."], "excludes": ["..."]}},
@@ -83,6 +86,7 @@ Now review the NEW batch of responses below and REFINE the frame:
 - Maximum {max_codes} substantive codes (plus 98 and 99).
 - The language is {language}.
 
+CRITICAL: Return ONLY valid JSON — no explanations, no markdown. Start with {{ and end with }}.
 Return the COMPLETE updated frame in the same JSON format (not just the diff).
 """
 

@@ -67,8 +67,10 @@ class ClaudeClient:
                     self._cli_path,
                     "-p",
                     "--output-format", "text",
+                    "--verbose",
                     "--no-session-persistence",
                     "--model", model,
+                    "--max-turns", "1",
                     "--disallowed-tools",
                     "Edit,Write,Bash,NotebookEdit,Glob,Grep,WebSearch,WebFetch",
                     "--system-prompt", system,
@@ -127,18 +129,39 @@ class ClaudeClient:
 
 
 def parse_json(raw: str) -> dict | list:
-    """Extract JSON from a string, tolerating markdown fences."""
+    """Extract JSON from a string, tolerating markdown fences and surrounding text."""
     raw = raw.strip()
+
+    # 1. Direct parse
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
-    # Try extracting from ```json ... ``` blocks
+
+    # 2. Extract from ```json ... ``` blocks
     match = re.search(r"```(?:json)?\s*\n?([\s\S]*?)```", raw)
     if match:
-        return json.loads(match.group(1).strip())
-    # Try finding a top-level [ ] or { }
-    match = re.search(r"(\{[\s\S]*\}|\[[\s\S]*\])", raw)
-    if match:
-        return json.loads(match.group(1))
-    raise ValueError(f"Could not extract JSON from response:\n{raw[:300]}...")
+        try:
+            return json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Find outermost { } (for dicts) — greedy from first { to last }
+    first_brace = raw.find("{")
+    last_brace = raw.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(raw[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 4. Find outermost [ ] (for arrays)
+    first_bracket = raw.find("[")
+    last_bracket = raw.rfind("]")
+    if first_bracket != -1 and last_bracket > first_bracket:
+        try:
+            return json.loads(raw[first_bracket : last_bracket + 1])
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Could not extract JSON from response:\n{raw[:500]}...")
