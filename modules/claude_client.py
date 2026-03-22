@@ -1,13 +1,14 @@
 """Claude Code CLI wrapper for Max subscription — no API key needed.
 
 Calls the `claude` CLI as a subprocess, passing prompts via stdin.
-Based on the pattern from qualitative-research-analyzer.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -18,8 +19,34 @@ MODEL_OPUS = "opus"
 MODEL_SONNET = "sonnet"
 
 
+def _find_claude_cli() -> str:
+    """Find the claude CLI executable, checking common locations."""
+    # Try PATH first
+    found = shutil.which("claude")
+    if found:
+        return found
+
+    # Check common npm global install locations (Windows)
+    candidates = [
+        os.path.expandvars(r"%APPDATA%\npm\claude.cmd"),
+        os.path.expandvars(r"%APPDATA%\npm\claude"),
+        os.path.expanduser("~/.npm-global/bin/claude"),
+        "/usr/local/bin/claude",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+
+    raise RuntimeError(
+        "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+    )
+
+
 class ClaudeClient:
     """Wrapper that calls Claude Code CLI in non-interactive mode."""
+
+    def __init__(self) -> None:
+        self._cli_path = _find_claude_cli()
 
     def call(
         self,
@@ -37,7 +64,7 @@ class ClaudeClient:
         for attempt in range(retries):
             try:
                 cmd = [
-                    "claude",
+                    self._cli_path,
                     "-p",
                     "--output-format", "text",
                     "--no-session-persistence",
@@ -47,6 +74,9 @@ class ClaudeClient:
                     "--system-prompt", system,
                 ]
 
+                # Remove CLAUDECODE env var to allow nested calls
+                env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
                 result = subprocess.run(
                     cmd,
                     input=user,
@@ -54,6 +84,7 @@ class ClaudeClient:
                     text=True,
                     encoding="utf-8",
                     timeout=timeout,
+                    env=env,
                 )
 
                 if result.returncode != 0:
@@ -71,11 +102,6 @@ class ClaudeClient:
                 if attempt < retries - 1:
                     time.sleep(retry_delay)
                     continue
-
-            except FileNotFoundError:
-                raise RuntimeError(
-                    "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
-                )
 
             except RuntimeError as exc:
                 last_err = exc
