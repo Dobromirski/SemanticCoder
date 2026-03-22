@@ -9,6 +9,7 @@ import streamlit as st
 
 from modules.claude_client import ClaudeClient
 from modules.auditor import audit_other_codes, reconcile_disagreements
+from modules.calibrator import extract_rules_from_corrections, format_rules_for_approval, merge_approved_rules
 from modules.coder import code_column
 from modules.data_io import (
     detect_text_columns,
@@ -45,10 +46,12 @@ DEFAULTS = {
     "frame_approved": False,
     "coded_df": None,
     "current_coding_col_idx": 0,
-    "coding_phase": "code",  # code → audit_98 → validate → reconcile → done
+    "coding_phase": "code",  # code → review_code → audit_98 → review_audit → validate → reconcile → done
     "audit_98_result": None,
     "validation": None,
     "reconciliation": None,
+    "calibration_sample": None,
+    "calibration_extracted": None,
 }
 for key, val in DEFAULTS.items():
     st.session_state.setdefault(key, val)
@@ -289,6 +292,157 @@ elif st.session_state.step == 3:
     def _code_col_name(tc: str) -> str:
         return tc.replace("t", "c") if tc.endswith("t") else f"{tc}_code"
 
+    # ----- Helper: render calibration review panel -----
+    def _render_calibration_panel(
+        phase_name: str,
+        text_col: str,
+        code_col: str,
+        next_phase: str,
+        next_label: str,
+    ):
+        """Show 30 random coded items for human review, extract rules from corrections."""
+        st.subheader(f"Calibration — Review 30 random codings ({phase_name})")
+        st.caption(
+            "Review these randomly selected codings. Correct any you disagree with. "
+            "The system will analyze your corrections and propose new decision rules."
+        )
+
+        # Generate sample once
+        if st.session_state.calibration_sample is None:
+            valid = df[df[code_col].notna() & ~df[code_col].isin([99])].copy()
+            n = min(30, len(valid))
+            sample = valid.sample(n=n, random_state=42)
+
+            # Build frame lookup for labels
+            code_labels = {c["code"]: c["label"] for c in frame.get("codes", [])}
+            code_labels[98] = "Other"
+            code_labels[99] = "DK/NA"
+
+            review_data = []
+            for idx, row in sample.iterrows():
+                code_val = int(row[code_col])
+                review_data.append({
+                    "row_id": int(idx),
+                    "text": str(row[text_col]).strip(),
+                    "assigned_code": code_val,
+                    "label": code_labels.get(code_val, f"Code {code_val}"),
+                    "your_code": code_val,
+                })
+            st.session_state.calibration_sample = review_data
+
+        review_data = st.session_state.calibration_sample
+
+        # Build code options for selectbox
+        code_options = {c["code"]: f"{c['code']} — {c['label']}" for c in frame.get("codes", [])}
+        code_options[98] = "98 — Other"
+        code_options[99] = "99 — DK/NA"
+        code_list = sorted(code_options.keys())
+
+        # Editable review table
+        st.write(f"**{len(review_data)} items to review:**")
+
+        corrections = []
+        for i, item in enumerate(review_data):
+            with st.container():
+                cols = st.columns([4, 2, 2])
+                with cols[0]:
+                    st.write(f"**[{item['row_id']}]** {item['text']}")
+                with cols[1]:
+                    st.caption(f"Assigned: {item['assigned_code']} — {item['label']}")
+                with cols[2]:
+                    new_code = st.selectbox(
+                        "Your code",
+                        options=code_list,
+                        format_func=lambda x: code_options.get(x, str(x)),
+                        index=code_list.index(item["assigned_code"]) if item["assigned_code"] in code_list else 0,
+                        key=f"cal_{phase_name}_{i}",
+                        label_visibility="collapsed",
+                    )
+                    if new_code != item["assigned_code"]:
+                        corrections.append({
+                            "row_id": item["row_id"],
+                            "text": item["text"],
+                            "original_code": item["assigned_code"],
+                            "corrected_code": new_code,
+                        })
+
+        st.divider()
+
+        if corrections:
+            st.info(f"You corrected **{len(corrections)}** out of {len(review_data)} items.")
+
+            # Extract rules button
+            if st.session_state.calibration_extracted is None:
+                if st.button("Analyze my corrections", type="primary"):
+                    client = get_client()
+                    with st.spinner("Extracting patterns from your corrections..."):
+                        extracted = extract_rules_from_corrections(
+                            client, corrections, len(review_data), frame,
+                        )
+                        st.session_state.calibration_extracted = extracted
+                        st.rerun()
+            else:
+                extracted = st.session_state.calibration_extracted
+                rules = extracted.get("extracted_rules", [])
+
+                if rules:
+                    st.markdown(format_rules_for_approval(extracted))
+
+                    # Checkboxes to approve/reject each rule
+                    approved = []
+                    for j, rule in enumerate(rules):
+                        checked = st.checkbox(
+                            f"Approve: {rule.get('rule', '')}",
+                            value=rule.get("confidence") in ("HIGH", "MEDIUM"),
+                            key=f"approve_rule_{phase_name}_{j}",
+                        )
+                        if checked:
+                            approved.append(rule)
+
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        if st.button("Apply approved rules & continue", type="primary"):
+                            # Apply corrections to df
+                            for c in corrections:
+                                df.at[c["row_id"], code_col] = int(c["corrected_code"])
+                            st.session_state.df = df
+
+                            # Merge approved rules into frame
+                            if approved:
+                                updated_frame = merge_approved_rules(frame, approved)
+                                st.session_state.frame = updated_frame
+
+                            st.session_state.calibration_sample = None
+                            st.session_state.calibration_extracted = None
+                            st.session_state.coding_phase = next_phase
+                            st.rerun()
+                    with col_b:
+                        if st.button("Skip rules, just apply corrections"):
+                            for c in corrections:
+                                df.at[c["row_id"], code_col] = int(c["corrected_code"])
+                            st.session_state.df = df
+                            st.session_state.calibration_sample = None
+                            st.session_state.calibration_extracted = None
+                            st.session_state.coding_phase = next_phase
+                            st.rerun()
+                else:
+                    st.success("No systematic patterns found — your corrections appear to be case-specific.")
+                    if st.button("Apply corrections & continue", type="primary"):
+                        for c in corrections:
+                            df.at[c["row_id"], code_col] = int(c["corrected_code"])
+                        st.session_state.df = df
+                        st.session_state.calibration_sample = None
+                        st.session_state.calibration_extracted = None
+                        st.session_state.coding_phase = next_phase
+                        st.rerun()
+        else:
+            st.success("No corrections — all 30 items look good!")
+            if st.button(next_label, type="primary"):
+                st.session_state.calibration_sample = None
+                st.session_state.calibration_extracted = None
+                st.session_state.coding_phase = next_phase
+                st.rerun()
+
     # --- PHASE 1: Coding (Sonnet) ---
     if phase == "code":
         if col_idx < len(text_cols):
@@ -313,7 +467,7 @@ elif st.session_state.step == 3:
                     st.session_state.current_coding_col_idx = col_idx + 1
                     st.rerun()
         else:
-            # All columns coded — show distribution and move to audit
+            # All columns coded — show distribution and move to review
             st.success(f"Agent 1 complete — all {len(text_cols)} columns coded.")
             for tc in text_cols:
                 cc = _code_col_name(tc)
@@ -322,15 +476,27 @@ elif st.session_state.step == 3:
                     dist = df[cc].value_counts().sort_index()
                     n98 = int(dist.get(98, 0))
                     n99 = int(dist.get(99, 0))
-                    total = len(df)
+                    total_rows = len(df)
                     st.bar_chart(dist)
                     if n98 + n99 > 0:
-                        pct = (n98 + n99) / total * 100
-                        st.warning(f"Code 98/99: {n98 + n99} responses ({pct:.1f}%) — Agent 2 will review these.")
+                        pct = (n98 + n99) / total_rows * 100
+                        st.warning(f"Code 98/99: {n98 + n99} responses ({pct:.1f}%)")
 
-            if st.button("Run Agent 2 — Audit 98/99 codes", type="primary"):
-                st.session_state.coding_phase = "audit_98"
+            if st.button("Review 30 random codings before audit", type="primary"):
+                st.session_state.coding_phase = "review_code"
                 st.rerun()
+
+    # --- PHASE 1b: Human review after initial coding ---
+    elif phase == "review_code":
+        text_col = text_cols[0]
+        code_col = _code_col_name(text_col)
+        _render_calibration_panel(
+            phase_name="after_coding",
+            text_col=text_col,
+            code_col=code_col,
+            next_phase="audit_98",
+            next_label="Proceed to Agent 2 — Audit 98/99 codes",
+        )
 
     # --- PHASE 2: Audit 98/99 (Opus) ---
     elif phase == "audit_98":
@@ -375,12 +541,24 @@ elif st.session_state.step == 3:
                 if cc in df.columns:
                     dist = df[cc].value_counts().sort_index()
                     n98 = int(dist.get(98, 0))
-                    total = len(df)
-                    st.write(f"**{cc}** after audit: {n98} remaining code 98 ({n98/total*100:.1f}%)")
+                    total_rows = len(df)
+                    st.write(f"**{cc}** after audit: {n98} remaining code 98 ({n98/total_rows*100:.1f}%)")
 
-            if st.button("Run Agent 3 — Independent Validation", type="primary"):
-                st.session_state.coding_phase = "validate"
+            if st.button("Review 30 random codings before validation", type="primary"):
+                st.session_state.coding_phase = "review_audit"
                 st.rerun()
+
+    # --- PHASE 2b: Human review after audit ---
+    elif phase == "review_audit":
+        text_col = text_cols[0]
+        code_col = _code_col_name(text_col)
+        _render_calibration_panel(
+            phase_name="after_audit",
+            text_col=text_col,
+            code_col=code_col,
+            next_phase="validate",
+            next_label="Proceed to Agent 3 — Independent Validation",
+        )
 
     # --- PHASE 3: Independent validation (Opus) ---
     elif phase == "validate":
