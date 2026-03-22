@@ -40,16 +40,19 @@ examples must also be in {language}.
 CRITICAL: Your response must contain ONLY valid JSON — no explanations, no headings, \
 no markdown fences, no text before or after the JSON. Start with {{ and end with }}.
 
+IMPORTANT: Keep the response COMPACT to avoid truncation. Use short descriptions (max 10 words). \
+Use 2-3 includes/excludes max. Do NOT write long explanations.
+
 JSON structure:
 {{
   "codes": [
-    {{"code": 1, "label": "...", "description": "...", "includes": ["..."], "excludes": ["..."]}},
+    {{"code": 1, "label": "...", "description": "max 10 words", "includes": ["2-3 examples"], "excludes": ["2-3 examples"]}},
     ...
     {{"code": 98, "label": "Друго", "description": "...", "includes": [], "excludes": []}},
     {{"code": 99, "label": "НЗ / БО", "description": "...", "includes": [], "excludes": []}}
   ],
   "decision_rules": [
-    {{"between": [1, 4], "rule": "..."}},
+    {{"between": [1, 4], "rule": "max 15 words"}},
     ...
   ]
 }}
